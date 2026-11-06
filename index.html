@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hand Swarm</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060d; overflow: hidden; font-family: system-ui, sans-serif; color: #cfe; }
+  canvas#fx { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #cam { position: fixed; right: 16px; bottom: 16px; width: 220px; border-radius: 10px; overflow: hidden;
+         border: 1px solid #2a3; opacity: .85; }
+  #cam video, #cam canvas { width: 100%; display: block; transform: scaleX(-1); }
+  #cam canvas { position: absolute; inset: 0; height: 100%; }
+  #hud { position: fixed; left: 16px; top: 16px; font-size: 13px; line-height: 1.6; background: #0008;
+         padding: 10px 14px; border-radius: 10px; border: 1px solid #1c3; max-width: 320px; }
+  #mode { font-size: 22px; font-weight: 700; color: #7f7; letter-spacing: 1px; }
+  #fps { opacity: .6; font-size: 11px; }
+  #start { position: fixed; inset: 0; display: grid; place-items: center; background: #05060dcc; z-index: 5; }
+  #start button { font-size: 20px; padding: 16px 34px; border-radius: 40px; border: 1px solid #5f8; background: #0b2;
+                  color: #fff; cursor: pointer; }
+  #start p { text-align: center; opacity: .8; }
+  kbd { background: #1a2a1a; border-radius: 4px; padding: 0 5px; }
+  /* hidden: info panel and webcam preview (they still run in the background) */
+  #hud, #cam { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="fx"></canvas>
+
+<div id="hud">
+  <div id="mode">IDLE</div>
+  <div id="status">Click start to enable the camera</div>
+  <div id="fps"></div>
+  <hr style="border-color:#1c3">
+  ✋ <b>Open palm</b> – swords orbit your hand<br>
+  ✊ <b>Fist</b> – swords gather into a tight core<br>
+  ☝️ <b>Point</b> – swords stream behind your fingertip<br>
+  ✌️ <b>Two fingers</b> – swords form a sweeping wave<br>
+  🤏 <b>Pinch</b> – swords burst outward<br>
+  <small>No camera? Move the mouse and press <kbd>1</kbd>–<kbd>5</kbd>.</small>
+</div>
+
+<div id="cam" hidden><video id="video" playsinline muted></video><canvas id="overlay"></canvas></div>
+
+<div id="start"><div>
+  <p>Gesture-controlled sword swarm</p>
+  <p style="text-align:center"><button id="go">Start camera</button></p>
+  <p><small>or <a href="#" id="mouse" style="color:#7f7">use the mouse instead</a></small></p>
+</div></div>
+
+<script type="module">
+const cv = document.getElementById('fx');
+const ctx = cv.getContext('2d', { alpha: false, desynchronized: true });
+let W, H, DPR;
+function resize() {
+  DPR = Math.min(devicePixelRatio || 1, 1.25);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', resize); resize();
+
+const MAX_N = 6000;
+let N = MAX_N; 
+const px = new Float32Array(MAX_N), py = new Float32Array(MAX_N);
+const vx = new Float32Array(MAX_N), vy = new Float32Array(MAX_N);
+const seed = new Float32Array(MAX_N), seed2 = new Float32Array(MAX_N), lag = new Float32Array(MAX_N);
+for (let i = 0; i < MAX_N; i++) {
+  px[i] = Math.random() * W; py[i] = Math.random() * H;
+  vx[i] = (Math.random() - .5) * 2; vy[i] = (Math.random() - .5) * 2;
+  seed[i] = Math.random(); seed2[i] = Math.random();
+  lag[i] = 0.75 + seed2[i] * 0.5;
+}
+
+const hand = { x: W / 2, y: H / 2, vx: 0, vy: 0, size: 120, visible: false, mode: 'idle', t: 0 };
+const sm = { x: W / 2, y: H / 2, size: 120 };
+const TRAIL = 70;
+const trailX = new Float32Array(TRAIL).fill(W / 2), trailY = new Float32Array(TRAIL).fill(H / 2);
+let trailHead = 0;
+let burstUntil = 0;
+
+const modeEl = document.getElementById('mode');
+const fpsEl = document.getElementById('fps');
+const labels = { idle: 'IDLE', palm: '✋ ORBIT', fist: '✊ GATHER', point: '☝️ STREAM', two: '✌️ WAVE', pinch: '🤏 BURST' };
+
+function setMode(m) {
+  if (m === hand.mode) return;
+  if (m === 'pinch') {
+    burstUntil = performance.now() + 380;
+    for (let i = 0; i < N; i++) {
+      const a = seed[i] * 6.2832, s = 16 + seed2[i] * 24;
+      vx[i] += Math.cos(a) * s; vy[i] += Math.sin(a) * s;
+    }
+  }
+  hand.mode = m;
+  modeEl.textContent = labels[m];
+}
+
+const PHYS = {
+  palm:  { pull: 0.09, damp: 0.74 },
+  fist:  { pull: 0.12, damp: 0.70 },
+  point: { pull: 0.10, damp: 0.72 },
+  two:   { pull: 0.07, damp: 0.76 },
+  pinch: { pull: 0.06, damp: 0.78 },
+  idle:  { pull: 0,    damp: 0.985 },
+  burst: { pull: 0,    damp: 0.95 },
+};
+
+const BUCKETS = 6;
+const colors = ['#1d6b3a', '#2fa24f', '#53d36a', '#8ef07a', '#d4ff9a', '#fff8c8'];
+
+let t0 = performance.now(), fpsAcc = 0, fpsFrames = 0, slowStreak = 0;
+function frame(now) {
+  const dtMs = now - t0; t0 = now;
+  const dt = Math.min(dtMs / 16.67, 3);
+  const t = now / 1000;
+
+  if (dtMs < 200) { fpsAcc += dtMs; fpsFrames++; }
+  if (fpsAcc > 500) {
+    const fps = 1000 * fpsFrames / fpsAcc;
+    fpsEl.textContent = `${fps.toFixed(0)} fps · ${N} swords`;
+    if (!document.hidden && fps > 10 && fps < 45 && N > 2000) { if (++slowStreak > 1) { N = Math.max(2000, N - 800); slowStreak = 0; } }
+    else { slowStreak = 0; if (fps > 57 && N < MAX_N) N = Math.min(MAX_N, N + 200); }
+    fpsAcc = 0; fpsFrames = 0;
+  }
+
+  
+  
+  if (hand.visible) {
+    const ahead = Math.min(now - hand.t, 50) / 1000; 
+    const tx = hand.x + hand.vx * ahead, ty = hand.y + hand.vy * ahead;
+    const dist = Math.hypot(tx - sm.x, ty - sm.y);
+    const k = Math.min(0.9, 0.45 + dist / 60) * Math.min(dt, 1.5);
+    sm.x += (tx - sm.x) * Math.min(k, 1);
+    sm.y += (ty - sm.y) * Math.min(k, 1);
+  }
+  sm.size += (hand.size - sm.size) * 0.25;
+  trailHead = (trailHead + 1) % TRAIL;
+  trailX[trailHead] = sm.x; trailY[trailHead] = sm.y;
+
+  const mode = hand.visible ? hand.mode : 'idle';
+  const bursting = now < burstUntil;
+  const P = bursting ? PHYS.burst : (PHYS[mode] || PHYS.idle);
+  const dampF = Math.pow(P.damp, dt), pullF = P.pull * dt;
+  const hx = sm.x, hy = sm.y, hs = sm.size;
+
+  for (let i = 0; i < N; i++) {
+    const s = seed[i], s2 = seed2[i];
+    let tx = px[i], ty = py[i], pull = pullF;
+    if (bursting) {
+      
+    } else if (mode === 'palm') {
+      const ring = (s2 * 4) | 0;
+      const r = hs * (1.1 + ring * 0.55) + Math.sin(t * 2 + s * 20) * 10;
+      const a = s * 6.2832 + t * (ring & 1 ? -1 : 1) * (0.9 - ring * 0.15);
+      tx = hx + Math.cos(a) * r; ty = hy + Math.sin(a) * r * 0.85;
+    } else if (mode === 'pinch') {
+      
+      const a = s * 6.2832 - t * 1.5, r = hs * (0.5 + s2 * 1.4);
+      tx = hx + Math.cos(a) * r; ty = hy + Math.sin(a) * r;
+    } else if (mode === 'fist') {
+      const a = s * 6.2832 + t * 4, r = hs * 0.35 * Math.sqrt(s2);
+      tx = hx + Math.cos(a) * r; ty = hy + Math.sin(a) * r;
+    } else if (mode === 'point') {
+      const idx = (trailHead - ((s * s * (TRAIL - 1)) | 0) + TRAIL) % TRAIL; 
+      const spread = 5 + s * 34, a = s2 * 6.2832 + t * 3;
+      tx = trailX[idx] + Math.cos(a) * spread; ty = trailY[idx] + Math.sin(a) * spread;
+    } else if (mode === 'two') {
+      const x = s * (W + 200) - 100;
+      tx = x; ty = hy + Math.sin((x - hx) / 180 - t * 4) * 70 * Math.exp(-Math.abs(x - hx) / 900) + (s2 - .5) * 50;
+    } else {
+      const a = Math.sin(px[i] * 0.003 + t * 0.3) + Math.cos(py[i] * 0.003 - t * 0.2);
+      vx[i] += Math.cos(a * 3) * 0.05; vy[i] += Math.sin(a * 3) * 0.05;
+    }
+    pull *= lag[i];
+    vx[i] = vx[i] * dampF + (tx - px[i]) * pull;
+    vy[i] = vy[i] * dampF + (ty - py[i]) * pull;
+    px[i] += vx[i] * dt; py[i] += vy[i] * dt;
+    if (mode === 'idle' && !bursting) {
+      if (px[i] < -20) px[i] += W + 40; else if (px[i] > W + 20) px[i] -= W + 40;
+      if (py[i] < -20) py[i] += H + 40; else if (py[i] > H + 20) py[i] -= H + 40;
+    }
+  }
+
+  
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = 'rgba(5,6,13,0.4)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineWidth = 1; ctx.lineCap = 'butt';
+  for (let b = 0; b < BUCKETS; b++) {
+    ctx.beginPath();
+    const lo = b * 6, hi = b === BUCKETS - 1 ? 1e9 : lo + 6;
+    for (let i = 0; i < N; i++) {
+      const sp = Math.abs(vx[i]) + Math.abs(vy[i]); 
+      if (sp < lo || sp >= hi) continue;
+      const len = (5 + Math.min(sp * 1.6, 22)) / (sp + 0.001);
+      ctx.moveTo(px[i], py[i]);
+      ctx.lineTo(px[i] - vx[i] * len, py[i] - vy[i] * len);
+    }
+    ctx.strokeStyle = colors[b];
+    ctx.stroke();
+  }
+
+  if (hand.visible) {
+    const g = ctx.createRadialGradient(hx, hy, 0, hx, hy, 60);
+    g.addColorStop(0, 'rgba(140,255,150,0.35)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g; ctx.fillRect(hx - 60, hy - 60, 120, 120);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+
+let useMouse = false;
+const keyModes = { '1': 'palm', '2': 'fist', '3': 'point', '4': 'two', '5': 'pinch' };
+addEventListener('mousemove', e => {
+  if (!useMouse) return;
+  hand.x = e.clientX; hand.y = e.clientY; hand.vx = 0; hand.vy = 0; hand.t = performance.now(); hand.visible = true;
+});
+addEventListener('keydown', e => { if (useMouse && keyModes[e.key]) setMode(keyModes[e.key]); });
+document.getElementById('mouse').onclick = e => {
+  e.preventDefault(); useMouse = true; hand.size = 110;
+  document.getElementById('start').remove();
+  document.getElementById('status').textContent = 'Mouse mode';
+  setMode('palm');
+};
+
+
+const statusEl = document.getElementById('status');
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const octx = overlay.getContext('2d');
+
+document.getElementById('go').onclick = async () => {
+  document.getElementById('start').remove();
+  try {
+    statusEl.textContent = 'Loading hand model…';
+    const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
+    const fileset = await vision.FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    const landmarker = await vision.HandLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU'
+      },
+      runningMode: 'VIDEO', numHands: 1,
+      minHandDetectionConfidence: 0.6, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5
+    });
+    statusEl.textContent = 'Starting camera…';
+    
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 480 }, height: { ideal: 360 }, frameRate: { ideal: 60 }, facingMode: 'user' }
+    });
+    video.srcObject = stream; await video.play();
+    document.getElementById('cam').hidden = false;
+    overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+    statusEl.textContent = 'Show your hand to the camera';
+
+    
+    const onFrame = (nowMs) => {
+      const res = landmarker.detectForVideo(video, nowMs);
+      handleHand(res.landmarks && res.landmarks[0], performance.now());
+      schedule();
+    };
+    const schedule = () => video.requestVideoFrameCallback
+      ? video.requestVideoFrameCallback(onFrame)
+      : requestAnimationFrame(onFrame);
+    schedule();
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = 'Camera/model failed: ' + err.message + ' — switching to mouse mode';
+    useMouse = true; setMode('palm');
+  }
+};
+
+const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+let missFrames = 0, candidate = 'idle', candidateCount = 0, pinchOn = false;
+
+
+
+function classify(lm) {
+  const wrist = lm[0];
+  const palm = d(wrist, lm[9]);                   
+  
+  const reach = (tip, mcp) => d(lm[tip], lm[mcp]) / palm;
+  const idx = reach(8, 5), mid = reach(12, 9), rng = reach(16, 13), pnk = reach(20, 17);
+  const up = r => r > 0.62, down = r => r < 0.45;
+
+  
+  const pinchD = d(lm[4], lm[8]) / palm;
+  pinchOn = pinchOn ? pinchD < 0.38 : pinchD < 0.25;
+  
+  const indexOut = d(lm[8], wrist) / palm > 1.15;
+  if (pinchOn && indexOut) return 'pinch';
+
+  if (down(idx) && down(mid) && down(rng) && down(pnk)) return 'fist';
+  if (up(idx) && up(mid) && down(rng) && down(pnk)) return 'two';
+  if (up(idx) && !up(mid) && !up(rng) && !up(pnk)) return 'point';
+  if ([idx, mid, rng, pnk].filter(up).length >= 3) return 'palm';
+  return null; 
+}
+
+function handleHand(lm, now) {
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  if (!lm) {
+    if (++missFrames > 6) { hand.visible = false; hand.mode = 'idle'; modeEl.textContent = labels.idle; }
+    return;
+  }
+  missFrames = 0;
+  octx.fillStyle = '#7f7';
+  for (const p of lm) octx.fillRect(p.x * overlay.width - 2, p.y * overlay.height - 2, 4, 4);
+
+  const g = classify(lm);
+  if (g) {
+    if (g === candidate) candidateCount++; else { candidate = g; candidateCount = 1; }
+    
+    if (candidateCount >= 2 || hand.mode === 'idle') setMode(g);
+  } else if (hand.mode === 'idle') setMode('palm');
+
+  const anchor = hand.mode === 'point' ? lm[8]
+    : { x: (lm[0].x + lm[5].x + lm[9].x + lm[13].x + lm[17].x) / 5, y: (lm[0].y + lm[5].y + lm[9].y + lm[13].y + lm[17].y) / 5 };
+  const nx = ((0.5 - anchor.x) * 1.3 + 0.5) * W; 
+  const ny = ((anchor.y - 0.5) * 1.3 + 0.5) * H;
+
+  
+  if (hand.visible && hand.t) {
+    const dts = Math.max((now - hand.t) / 1000, 0.008);
+    hand.vx = hand.vx * 0.5 + ((nx - hand.x) / dts) * 0.5;
+    hand.vy = hand.vy * 0.5 + ((ny - hand.y) / dts) * 0.5;
+  } else { hand.vx = hand.vy = 0; sm.x = nx; sm.y = ny; }
+  hand.x = nx; hand.y = ny; hand.t = now;
+  hand.size = Math.max(50, Math.min(260, d(lm[0], lm[9]) * W * 0.9));
+  hand.visible = true;
+  statusEl.textContent = 'Tracking hand';
+}
+</script>
+</body>
+</html>
