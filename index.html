@@ -20,8 +20,8 @@
                   color: #fff; cursor: pointer; }
   #start p { text-align: center; opacity: .8; }
   kbd { background: #1a2a1a; border-radius: 4px; padding: 0 5px; }
-  /* hidden: info panel and webcam preview (they still run in the background) */
-  #hud, #cam { display: none !important; }
+  /* hidden: info panel (still runs in the background) */
+  #hud { display: none !important; }
 </style>
 </head>
 <body>
@@ -40,7 +40,7 @@
   <small>No camera? Move the mouse and press <kbd>1</kbd>–<kbd>5</kbd>.</small>
 </div>
 
-<div id="cam" hidden><video id="video" playsinline muted></video><canvas id="overlay"></canvas></div>
+<div id="cam"><video id="video" playsinline muted></video><canvas id="overlay"></canvas></div>
 
 <div id="start"><div>
   <p>Gesture-controlled sword swarm</p>
